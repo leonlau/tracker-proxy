@@ -611,17 +611,36 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	// 后台拉上游列表,SIGINT/SIGTERM 时退出
+	// SIGINT/SIGTERM 触发 ctx 取消,用于后台 goroutine + HTTP server shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go refreshLoop(ctx)
 
-	http.HandleFunc("/announce", announceHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/announce", announceHandler)
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	// ctx 取消时优雅关闭 HTTP server
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutdown signal received")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("shutdown failed", "err", err)
+		}
+	}()
 
 	slog.Info("tracker proxy listening", "addr", ":8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	// ListenAndServe 在 Shutdown 被调后返回 http.ErrServerClosed,这是正常路径
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("listen failed", "err", err)
 		os.Exit(1)
 	}
+	slog.Info("tracker proxy stopped")
 }
