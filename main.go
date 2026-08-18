@@ -30,10 +30,10 @@ const upstreamListURL = "https://ngosang.github.io/trackerslist/trackers_all.txt
 
 const (
 	cacheTTL            = 5 * time.Minute
-	upstreamHTTPTimeout = 8 * time.Second
-	upstreamUDPTimeout  = 5 * time.Second
+	upstreamHTTPTimeout = 4 * time.Second
+	upstreamUDPTimeout  = 3 * time.Second
 	upstreamListTimeout = 30 * time.Second
-	overallTimeout      = 10 * time.Second
+	overallTimeout      = 5 * time.Second
 	refreshInterval     = 2 * time.Hour
 	defaultNumWant      = 50
 	defaultListenPort   = 6881
@@ -315,19 +315,21 @@ func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) Upstrea
 	client := http.Client{Timeout: upstreamHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		slog.Warn("http tracker request failed", "url", tracker, "err", err)
+		// 网络/DNS/超时 — 公开 tracker 常态,DEBUG 级别
+		slog.Debug("http tracker unreachable", "url", tracker, "err", err)
 		return UpstreamResult{}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// 非 200 可能是 tracker 配置 / Cloudflare 错误 — WARN 值得看
 		slog.Warn("http tracker non-200", "url", tracker, "status", resp.StatusCode)
 		return UpstreamResult{}
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		slog.Warn("http tracker read body failed", "url", tracker, "err", err)
+		slog.Debug("http tracker read body failed", "url", tracker, "err", err)
 		return UpstreamResult{}
 	}
 
@@ -337,6 +339,7 @@ func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) Upstrea
 		Incomplete int32  `bencode:"incomplete"`
 	}
 	if err := bencode.DecodeBytes(data, &decoded); err != nil {
+		// 协议错误 — tracker 返回了非 bencode,是上游 BUG
 		slog.Warn("http tracker decode failed", "url", tracker, "err", err)
 		return UpstreamResult{}
 	}
@@ -352,13 +355,13 @@ func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) Upstrea
 func queryUDPTracker(ctx context.Context, addr string, q url.Values) UpstreamResult {
 	server, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		slog.Warn("resolve udp addr failed", "addr", addr, "err", err)
+		slog.Debug("resolve udp addr failed", "addr", addr, "err", err)
 		return UpstreamResult{}
 	}
 
 	conn, err := net.DialUDP("udp", nil, server)
 	if err != nil {
-		slog.Warn("dial udp failed", "addr", addr, "err", err)
+		slog.Debug("dial udp failed", "addr", addr, "err", err)
 		return UpstreamResult{}
 	}
 	defer conn.Close()
@@ -366,12 +369,12 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) UpstreamRes
 	// 用 ctx 控制整体 deadline,与上层 overallTimeout 对齐
 	if d, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(d); err != nil {
-			slog.Warn("set deadline failed", "addr", addr, "err", err)
+			slog.Debug("set deadline failed", "addr", addr, "err", err)
 			return UpstreamResult{}
 		}
 	} else {
 		if err := conn.SetDeadline(time.Now().Add(upstreamUDPTimeout)); err != nil {
-			slog.Warn("set deadline failed", "addr", addr, "err", err)
+			slog.Debug("set deadline failed", "addr", addr, "err", err)
 			return UpstreamResult{}
 		}
 	}
@@ -385,18 +388,18 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) UpstreamRes
 	binary.BigEndian.PutUint32(connectReq[12:16], transaction)
 
 	if _, err := conn.Write(connectReq); err != nil {
-		slog.Warn("udp connect write failed", "addr", addr, "err", err)
+		slog.Debug("udp connect write failed", "addr", addr, "err", err)
 		return UpstreamResult{}
 	}
 
 	respBuf := make([]byte, 2048)
 	n, err := conn.Read(respBuf)
 	if err != nil || n < 16 {
-		slog.Warn("udp connect read failed", "addr", addr, "err", err, "n", n)
+		slog.Debug("udp connect read failed", "addr", addr, "err", err, "n", n)
 		return UpstreamResult{}
 	}
 
-	// 校验 response: action=0 + transaction_id 匹配
+	// 校验 response: action=0 + transaction_id 匹配 — 协议错误,WARN
 	respAction := binary.BigEndian.Uint32(respBuf[0:4])
 	respTx := binary.BigEndian.Uint32(respBuf[4:8])
 	if respAction != 0 || respTx != transaction {
@@ -433,17 +436,18 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) UpstreamRes
 	)
 
 	if _, err := conn.Write(packet); err != nil {
-		slog.Warn("udp announce write failed", "addr", addr, "err", err)
+		slog.Debug("udp announce write failed", "addr", addr, "err", err)
 		return UpstreamResult{}
 	}
 
 	n, err = conn.Read(respBuf)
 	if err != nil || n < 20 {
-		slog.Warn("udp announce read failed", "addr", addr, "err", err, "n", n)
+		// 部分 tracker 返回 < 20 字节(协议不兼容或 IP 白名单拒绝)— DEBUG
+		slog.Debug("udp announce read failed", "addr", addr, "err", err, "n", n)
 		return UpstreamResult{}
 	}
 
-	// 校验 announce response
+	// 校验 announce response — 协议错误,WARN
 	respAction = binary.BigEndian.Uint32(respBuf[0:4])
 	respTx = binary.BigEndian.Uint32(respBuf[4:8])
 	if respAction != 1 || respTx != transaction {
