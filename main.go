@@ -7,12 +7,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -607,7 +607,7 @@ func refreshLoop(ctx context.Context) {
 }
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(log.Writer(), &slog.HandlerOptions{
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
@@ -619,6 +619,9 @@ func main() {
 
 	http.HandleFunc("/announce", announceHandler)
 
-	fmt.Println("tracker proxy listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	slog.Info("tracker proxy listening", "addr", ":8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		slog.Error("listen failed", "err", err)
+		os.Exit(1)
+	}
 }
