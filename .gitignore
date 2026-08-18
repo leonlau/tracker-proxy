@@ -1,0 +1,20 @@
+# Go build artifacts
+/tracker-proxy
+/dist/
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.fleet/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude / agent local state
+/.claude/
