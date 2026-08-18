@@ -45,6 +45,14 @@ type UpstreamList struct {
 	UDP  []string // host:port
 }
 
+// UpstreamResult 单个上游查询结果
+// Complete / Incomplete 透传上游的种子/下载者计数
+type UpstreamResult struct {
+	Peers      []byte
+	Complete   int32
+	Incomplete int32
+}
+
 // upstreamList 持有当前生效的列表
 // 启动时填充 fallback,后台 goroutine 每 2 小时刷新一次
 var upstreamList atomic.Pointer[UpstreamList]
@@ -67,28 +75,28 @@ func init() {
 }
 
 type CacheItem struct {
-	Peers  []byte
+	Result UpstreamResult
 	Expire time.Time
 }
 
 var cache sync.Map
 
-func cacheGet(key string) ([]byte, bool) {
+func cacheGet(key string) (UpstreamResult, bool) {
 	v, ok := cache.Load(key)
 	if !ok {
-		return nil, false
+		return UpstreamResult{}, false
 	}
 	item := v.(CacheItem)
 	if time.Now().After(item.Expire) {
 		cache.Delete(key)
-		return nil, false
+		return UpstreamResult{}, false
 	}
-	return item.Peers, true
+	return item.Result, true
 }
 
-func cacheSet(key string, peers []byte) {
+func cacheSet(key string, r UpstreamResult) {
 	cache.Store(key, CacheItem{
-		Peers:  peers,
+		Result: r,
 		Expire: time.Now().Add(cacheTTL),
 	})
 }
@@ -201,8 +209,8 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 	infoHashKey := string(infoHashBytes)
 
 	// 缓存命中直接返回
-	if peers, ok := cacheGet(infoHashKey); ok {
-		sendResponse(w, peers)
+	if result, ok := cacheGet(infoHashKey); ok {
+		sendResponse(w, result)
 		return
 	}
 
@@ -210,22 +218,23 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), overallTimeout)
 	defer cancel()
 
-	peers := queryUpstreams(ctx, q)
+	result := queryUpstreams(ctx, q)
 
-	if len(peers) == 0 {
+	if len(result.Peers) == 0 {
 		slog.Warn("no peers from any upstream",
 			"info_hash", fmt.Sprintf("%x", infoHashBytes))
 	}
 
-	cacheSet(infoHashKey, peers)
-	sendResponse(w, peers)
+	cacheSet(infoHashKey, result)
+	sendResponse(w, result)
 }
 
-// queryUpstreams 并发查询所有上游,合并去重 peer
-func queryUpstreams(ctx context.Context, q url.Values) []byte {
+// queryUpstreams 并发查询所有上游,合并去重 peer 与 summary
+// summary 字段取 sum(每个上游都回报它看到的 swarm 数,客户端可自行判断)
+func queryUpstreams(ctx context.Context, q url.Values) UpstreamResult {
 	list := upstreamList.Load()
 	if list == nil {
-		return nil
+		return UpstreamResult{}
 	}
 	httpTrackers := list.HTTP
 	udpTrackers := list.UDP
@@ -233,7 +242,7 @@ func queryUpstreams(ctx context.Context, q url.Values) []byte {
 	totalUpstreams := len(httpTrackers) + len(udpTrackers)
 
 	// channel 必须有缓冲,否则上游 goroutine 多时全部卡死在 send 上
-	result := make(chan []byte, totalUpstreams)
+	ch := make(chan UpstreamResult, totalUpstreams)
 
 	var wg sync.WaitGroup
 
@@ -241,9 +250,9 @@ func queryUpstreams(ctx context.Context, q url.Values) []byte {
 		wg.Add(1)
 		go func(tracker string) {
 			defer wg.Done()
-			if p := queryHTTPTracker(ctx, tracker, q); len(p) > 0 {
+			if r := queryHTTPTracker(ctx, tracker, q); len(r.Peers) > 0 || r.Complete > 0 || r.Incomplete > 0 {
 				select {
-				case result <- p:
+				case ch <- r:
 				case <-ctx.Done():
 				}
 			}
@@ -254,9 +263,9 @@ func queryUpstreams(ctx context.Context, q url.Values) []byte {
 		wg.Add(1)
 		go func(tracker string) {
 			defer wg.Done()
-			if p := queryUDPTracker(ctx, tracker, q); len(p) > 0 {
+			if r := queryUDPTracker(ctx, tracker, q); len(r.Peers) > 0 || r.Complete > 0 || r.Incomplete > 0 {
 				select {
-				case result <- p:
+				case ch <- r:
 				case <-ctx.Done():
 				}
 			}
@@ -265,79 +274,92 @@ func queryUpstreams(ctx context.Context, q url.Values) []byte {
 
 	go func() {
 		wg.Wait()
-		close(result)
+		close(ch)
 	}()
 
-	var parts [][]byte
+	var (
+		parts    [][]byte
+		combined UpstreamResult
+	)
 	for {
 		select {
-		case p, ok := <-result:
+		case r, ok := <-ch:
 			if !ok {
-				return dedupeIPv4Peers(parts)
+				combined.Peers = dedupeIPv4Peers(parts)
+				return combined
 			}
-			parts = append(parts, p)
+			parts = append(parts, r.Peers)
+			combined.Complete += r.Complete
+			combined.Incomplete += r.Incomplete
 		case <-ctx.Done():
-			return dedupeIPv4Peers(parts)
+			combined.Peers = dedupeIPv4Peers(parts)
+			return combined
 		}
 	}
 }
 
-func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) []byte {
+func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) UpstreamResult {
 	u, err := url.Parse(tracker)
 	if err != nil {
 		slog.Warn("parse tracker url failed", "url", tracker, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		slog.Warn("build request failed", "url", tracker, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 
 	client := http.Client{Timeout: upstreamHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.Warn("http tracker request failed", "url", tracker, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("http tracker non-200", "url", tracker, "status", resp.StatusCode)
-		return nil
+		return UpstreamResult{}
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		slog.Warn("http tracker read body failed", "url", tracker, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 
-	var result struct {
-		Peers []byte `bencode:"peers"`
+	var decoded struct {
+		Peers      []byte `bencode:"peers"`
+		Complete   int32  `bencode:"complete"`
+		Incomplete int32  `bencode:"incomplete"`
 	}
-	if err := bencode.DecodeBytes(data, &result); err != nil {
+	if err := bencode.DecodeBytes(data, &decoded); err != nil {
 		slog.Warn("http tracker decode failed", "url", tracker, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
-	return result.Peers
+	return UpstreamResult{
+		Peers:      decoded.Peers,
+		Complete:   decoded.Complete,
+		Incomplete: decoded.Incomplete,
+	}
 }
 
 // queryUDPTracker 实现 BEP 15: connect + announce
 // https://www.bittorrent.org/beps/bep_0015.html
-func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
+func queryUDPTracker(ctx context.Context, addr string, q url.Values) UpstreamResult {
 	server, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		slog.Warn("resolve udp addr failed", "addr", addr, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 
 	conn, err := net.DialUDP("udp", nil, server)
 	if err != nil {
 		slog.Warn("dial udp failed", "addr", addr, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 	defer conn.Close()
 
@@ -345,12 +367,12 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
 	if d, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(d); err != nil {
 			slog.Warn("set deadline failed", "addr", addr, "err", err)
-			return nil
+			return UpstreamResult{}
 		}
 	} else {
 		if err := conn.SetDeadline(time.Now().Add(upstreamUDPTimeout)); err != nil {
 			slog.Warn("set deadline failed", "addr", addr, "err", err)
-			return nil
+			return UpstreamResult{}
 		}
 	}
 
@@ -364,14 +386,14 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
 
 	if _, err := conn.Write(connectReq); err != nil {
 		slog.Warn("udp connect write failed", "addr", addr, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 
 	respBuf := make([]byte, 2048)
 	n, err := conn.Read(respBuf)
 	if err != nil || n < 16 {
 		slog.Warn("udp connect read failed", "addr", addr, "err", err, "n", n)
-		return nil
+		return UpstreamResult{}
 	}
 
 	// 校验 response: action=0 + transaction_id 匹配
@@ -380,7 +402,7 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
 	if respAction != 0 || respTx != transaction {
 		slog.Warn("udp connect response invalid",
 			"addr", addr, "action", respAction, "tx", respTx)
-		return nil
+		return UpstreamResult{}
 	}
 	connectionID := binary.BigEndian.Uint64(respBuf[8:16])
 
@@ -388,7 +410,7 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
 	infoHash := rawInfoHash(q)
 	peerID := rawPeerID(q)
 	if len(infoHash) != 20 || len(peerID) != 20 {
-		return nil
+		return UpstreamResult{}
 	}
 
 	downloaded := uint64Param(q, "downloaded")
@@ -412,13 +434,13 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
 
 	if _, err := conn.Write(packet); err != nil {
 		slog.Warn("udp announce write failed", "addr", addr, "err", err)
-		return nil
+		return UpstreamResult{}
 	}
 
 	n, err = conn.Read(respBuf)
 	if err != nil || n < 20 {
 		slog.Warn("udp announce read failed", "addr", addr, "err", err, "n", n)
-		return nil
+		return UpstreamResult{}
 	}
 
 	// 校验 announce response
@@ -427,20 +449,40 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) []byte {
 	if respAction != 1 || respTx != transaction {
 		slog.Warn("udp announce response invalid",
 			"addr", addr, "action", respAction, "tx", respTx)
-		return nil
+		return UpstreamResult{}
 	}
 
-	// peers 从 offset 20 开始 (action + tx + interval + leechers + seeders)
-	return respBuf[20:n]
+	return parseUDPAnnounceResponse(respBuf[:n])
 }
 
-func sendResponse(w http.ResponseWriter, peers []byte) {
+// parseUDPAnnounceResponse 从 BEP 15 announce response 里解析 seeders/leechers/peers
+//
+//	0-4   action (1, 已校验过)
+//	4-8   transaction_id
+//	8-12  interval  (uint32)
+//	12-16 leechers  (uint32) -> incomplete
+//	16-20 seeders   (uint32) -> complete
+//	20+   peers (compact)
+func parseUDPAnnounceResponse(buf []byte) UpstreamResult {
+	if len(buf) < 20 {
+		return UpstreamResult{}
+	}
+	leechers := int32(binary.BigEndian.Uint32(buf[12:16]))
+	seeders := int32(binary.BigEndian.Uint32(buf[16:20]))
+	return UpstreamResult{
+		Peers:      buf[20:],
+		Complete:   seeders,
+		Incomplete: leechers,
+	}
+}
+
+func sendResponse(w http.ResponseWriter, r UpstreamResult) {
 	resp := map[string]any{
 		"interval":     int32(1800),
 		"min interval": int32(900),
-		"complete":     int32(0),
-		"incomplete":   int32(0),
-		"peers":        peers,
+		"complete":     r.Complete,
+		"incomplete":   r.Incomplete,
+		"peers":        r.Peers,
 	}
 
 	data, err := bencode.EncodeBytes(resp)

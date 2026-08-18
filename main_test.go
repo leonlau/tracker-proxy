@@ -180,27 +180,37 @@ func TestEventCode(t *testing.T) {
 
 func TestCacheGetSet(t *testing.T) {
 	key := "test-key"
-	peers := []byte{1, 2, 3, 4, 5, 6}
+	want := UpstreamResult{
+		Peers:      []byte{1, 2, 3, 4, 5, 6},
+		Complete:   10,
+		Incomplete: 20,
+	}
 
 	// 不存在的 key
 	if got, ok := cacheGet(key); ok {
-		t.Errorf("cacheGet on missing key returned ok=true, data=%v", got)
+		t.Errorf("cacheGet on missing key returned ok=true, data=%+v", got)
 	}
 
-	cacheSet(key, peers)
+	cacheSet(key, want)
 
 	// 写入后立即可读
 	got, ok := cacheGet(key)
 	if !ok {
 		t.Fatalf("cacheGet after cacheSet returned ok=false")
 	}
-	if !bytesEqual(got, peers) {
-		t.Errorf("cacheGet = %v, want %v", got, peers)
+	if !bytesEqual(got.Peers, want.Peers) {
+		t.Errorf("cacheGet.Peers = %v, want %v", got.Peers, want.Peers)
+	}
+	if got.Complete != want.Complete {
+		t.Errorf("cacheGet.Complete = %d, want %d", got.Complete, want.Complete)
+	}
+	if got.Incomplete != want.Incomplete {
+		t.Errorf("cacheGet.Incomplete = %d, want %d", got.Incomplete, want.Incomplete)
 	}
 
 	// 强制过期
 	cache.Store(key, CacheItem{
-		Peers:  peers,
+		Result: want,
 		Expire: time.Now().Add(-1 * time.Second),
 	})
 	if _, ok := cacheGet(key); ok {
@@ -300,11 +310,15 @@ func TestUint32Param(t *testing.T) {
 }
 
 func TestSendResponse_BencodeFormat(t *testing.T) {
-	// 验证 sendResponse 输出是合法的 bencode
-	peers := []byte{1, 2, 3, 4, 5, 6}
+	// 验证 sendResponse 输出是合法的 bencode 且 summary 透传
+	result := UpstreamResult{
+		Peers:      []byte{1, 2, 3, 4, 5, 6},
+		Complete:   42,
+		Incomplete: 7,
+	}
 
 	rec := httptest.NewRecorder()
-	sendResponse(rec, peers)
+	sendResponse(rec, result)
 
 	body := rec.Body.Bytes()
 	if !strings.HasPrefix(string(body), "d") {
@@ -326,8 +340,15 @@ func TestSendResponse_BencodeFormat(t *testing.T) {
 	if !ok {
 		t.Fatalf("response peers type = %T, want string", decoded["peers"])
 	}
-	if gotPeers != string(peers) {
-		t.Errorf("response peers = %v, want %v", gotPeers, peers)
+	if gotPeers != string(result.Peers) {
+		t.Errorf("response peers = %v, want %v", gotPeers, result.Peers)
+	}
+
+	if got := decoded["complete"].(int64); got != int64(result.Complete) {
+		t.Errorf("response complete = %d, want %d", got, result.Complete)
+	}
+	if got := decoded["incomplete"].(int64); got != int64(result.Incomplete) {
+		t.Errorf("response incomplete = %d, want %d", got, result.Incomplete)
 	}
 
 	if got := rec.Header().Get("Content-Type"); got != "text/plain" {
@@ -336,13 +357,10 @@ func TestSendResponse_BencodeFormat(t *testing.T) {
 }
 
 func TestSendResponse_EncodeError(t *testing.T) {
-	// sendResponse 在 bencode 编码失败时应返回 500
-	// 通过构造一个不可编码的 channel 触发
+	// 当前实现里 peers=nil 也能正常编码,只验证不 panic
 	rec := httptest.NewRecorder()
-	sendResponse(rec, nil)
+	sendResponse(rec, UpstreamResult{})
 
-	// 当前实现里 peers=nil 也能正常编码,所以这里只验证不 panic
-	// 更严格的错误注入需要改 sendResponse 签名,留待以后
 	if rec.Body.Len() == 0 {
 		t.Errorf("expected bencode body")
 	}
@@ -461,6 +479,71 @@ func TestParseTrackerList_LongLineBuffer(t *testing.T) {
 	list := parseTrackerList([]byte(input))
 	if len(list.UDP) != 2 {
 		t.Errorf("expected 2 UDP trackers, got %d: %v", len(list.UDP), list.UDP)
+	}
+}
+
+func TestParseUDPAnnounceResponse(t *testing.T) {
+	// 构造一个合法 BEP 15 announce response
+	// 0-4   action (1, 已校验)
+	// 4-8   transaction_id
+	// 8-12  interval
+	// 12-16 leechers
+	// 16-20 seeders
+	// 20+   peers (compact IPv4)
+	buf := make([]byte, 32)
+	binary.BigEndian.PutUint32(buf[0:4], 1)
+	binary.BigEndian.PutUint32(buf[4:8], 0xAABBCCDD)
+	binary.BigEndian.PutUint32(buf[8:12], 1800)   // interval
+	binary.BigEndian.PutUint32(buf[12:16], 42)    // leechers -> incomplete
+	binary.BigEndian.PutUint32(buf[16:20], 7)     // seeders -> complete
+	// 2 个 peer: 1.2.3.4:6881, 5.6.7.8:6882
+	buf[20] = 1
+	buf[21] = 2
+	buf[22] = 3
+	buf[23] = 4
+	binary.BigEndian.PutUint16(buf[24:26], 6881)
+	buf[26] = 5
+	buf[27] = 6
+	buf[28] = 7
+	buf[29] = 8
+	binary.BigEndian.PutUint16(buf[30:32], 6882)
+
+	r := parseUDPAnnounceResponse(buf)
+
+	if r.Complete != 7 {
+		t.Errorf("Complete = %d, want 7", r.Complete)
+	}
+	if r.Incomplete != 42 {
+		t.Errorf("Incomplete = %d, want 42", r.Incomplete)
+	}
+	if !bytesEqual(r.Peers, []byte{1, 2, 3, 4, 0x1A, 0xE1, 5, 6, 7, 8, 0x1A, 0xE2}) {
+		t.Errorf("Peers = %v, want 2 IPv4 peers", r.Peers)
+	}
+}
+
+func TestParseUDPAnnounceResponse_EmptyPeers(t *testing.T) {
+	// 最小合法 response (20 字节,无 peer)
+	buf := make([]byte, 20)
+	binary.BigEndian.PutUint32(buf[0:4], 1)
+	binary.BigEndian.PutUint32(buf[8:12], 1800)
+	binary.BigEndian.PutUint32(buf[12:16], 100)
+	binary.BigEndian.PutUint32(buf[16:20], 50)
+
+	r := parseUDPAnnounceResponse(buf)
+
+	if r.Complete != 50 || r.Incomplete != 100 {
+		t.Errorf("got complete=%d incomplete=%d, want 50/100",
+			r.Complete, r.Incomplete)
+	}
+	if len(r.Peers) != 0 {
+		t.Errorf("expected empty peers, got %d bytes", len(r.Peers))
+	}
+}
+
+func TestParseUDPAnnounceResponse_TooShort(t *testing.T) {
+	r := parseUDPAnnounceResponse([]byte{1, 2, 3})
+	if r.Peers != nil || r.Complete != 0 || r.Incomplete != 0 {
+		t.Errorf("short buf should return zero result, got %+v", r)
 	}
 }
 
