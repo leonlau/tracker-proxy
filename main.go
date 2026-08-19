@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -783,11 +784,185 @@ func refreshLoop(ctx context.Context) {
 	}
 }
 
+// runCheck is the diagnostic mode: probes every upstream and queries the
+// given magnet/info_hash against each one, then prints a per-tracker
+// report. Does not start the HTTP server.
+//
+// Accepts either:
+//   - a magnet URL:  magnet:?xt=urn:btih:<40-hex>
+//   - a raw 40-char hex info_hash
+func runCheck(arg string) {
+	infoHash, hexStr, err := extractInfoHash(arg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "expected: magnet:?xt=urn:btih:<40hex>  or  <40hex>\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("=== tracker proxy diagnostic ===\n")
+	fmt.Printf("info_hash: %s  (%d bytes)\n\n", hexStr, len(infoHash))
+
+	// 1) load + health check
+	fmt.Println("[1/3] loading upstream list...")
+	ctx := context.Background()
+	rawList, err := loadUpstreamList(ctx, upstreamListURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load upstream list failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("      raw list: %d HTTP + %d UDP\n\n", len(rawList.HTTP), len(rawList.UDP))
+
+	fmt.Println("[2/3] probing reachability...")
+	t := time.Now()
+	alive := healthCheck(ctx, rawList)
+	fmt.Printf("      alive:    %d HTTP + %d UDP  (%s)\n\n",
+		len(alive.HTTP), len(alive.UDP), time.Since(t).Truncate(100*time.Millisecond))
+
+	// 2) per-tracker announce
+	fmt.Println("[3/3] querying each alive upstream with the info_hash...")
+	q := buildAnnounceQuery(infoHash)
+
+	type row struct {
+		kind     string
+		target   string
+		peers    int
+		seeders  int32
+		leechers int32
+	}
+	rows := make([]row, 0, len(alive.HTTP)+len(alive.UDP))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, probeConcurrency)
+
+	queryHTTP := func(target string) {
+		defer wg.Done()
+		defer func() { <-sem }()
+		sem <- struct{}{}
+		cctx, cancel := context.WithTimeout(ctx, upstreamHTTPTimeout)
+		defer cancel()
+		r := queryHTTPTracker(cctx, target, q)
+		mu.Lock()
+		rows = append(rows, row{
+			kind: "HTTP", target: target,
+			peers:    len(r.Peers) / 6,
+			seeders:  r.Complete,
+			leechers: r.Incomplete,
+		})
+		mu.Unlock()
+	}
+	queryUDP := func(target string) {
+		defer wg.Done()
+		defer func() { <-sem }()
+		sem <- struct{}{}
+		cctx, cancel := context.WithTimeout(ctx, upstreamUDPTimeout)
+		defer cancel()
+		r := queryUDPTracker(cctx, target, q)
+		mu.Lock()
+		rows = append(rows, row{
+			kind: "UDP", target: target,
+			peers:    len(r.Peers) / 6,
+			seeders:  r.Complete,
+			leechers: r.Incomplete,
+		})
+		mu.Unlock()
+	}
+	for _, t := range alive.HTTP {
+		wg.Add(1)
+		go queryHTTP(t)
+	}
+	for _, t := range alive.UDP {
+		wg.Add(1)
+		go queryUDP(t)
+	}
+	wg.Wait()
+
+	// 3) report
+	var totalSeeds, totalLeech int32
+	for _, r := range rows {
+		totalSeeds += r.seeders
+		totalLeech += r.leechers
+	}
+
+	fmt.Println()
+	fmt.Println("=== per-tracker results ===")
+	fmt.Printf("%-7s %-55s %5s %5s %5s\n", "KIND", "TRACKER", "PEERS", "LEECH", "SEEDS")
+	fmt.Println(strings.Repeat("-", 90))
+	var okCount int
+	for _, r := range rows {
+		status := "OK"
+		if r.peers == 0 && r.seeders == 0 && r.leechers == 0 {
+			status = "empty"
+		} else {
+			okCount++
+		}
+		display := r.target
+		if len(display) > 54 {
+			display = display[:51] + "..."
+		}
+		fmt.Printf("%-7s %-55s %5d %5d %5d  %s\n",
+			r.kind, display, r.peers, r.leechers, r.seeders, status)
+	}
+	fmt.Println(strings.Repeat("-", 90))
+	fmt.Printf("%d trackers responded with data out of %d\n", okCount, len(rows))
+	fmt.Printf("sum(seeders)=%d  sum(leechers)=%d\n", totalSeeds, totalLeech)
+}
+
+// extractInfoHash returns 20-byte info_hash + canonical hex string.
+// Accepts magnet:?xt=urn:btih:<hex> or raw 40-char hex.
+func extractInfoHash(arg string) ([]byte, string, error) {
+	hexStr := arg
+	if strings.HasPrefix(arg, "magnet:") {
+		u, err := url.Parse(arg)
+		if err != nil {
+			return nil, "", err
+		}
+		xt := u.Query().Get("xt")
+		if !strings.HasPrefix(xt, "urn:btih:") {
+			return nil, "", fmt.Errorf("magnet missing urn:btih: xt")
+		}
+		hexStr = strings.TrimPrefix(xt, "urn:btih:")
+	}
+	hexStr = strings.ToLower(strings.TrimSpace(hexStr))
+	if len(hexStr) != 40 {
+		return nil, "", fmt.Errorf("info_hash must be 40 hex chars, got %d", len(hexStr))
+	}
+	b, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, "", err
+	}
+	return b, hexStr, nil
+}
+
+// buildAnnounceQuery constructs the url.Values sent to every upstream.
+// Fixed test parameters — actual /announce clients send more, but
+// upstream trackers treat this consistently for diagnostic purposes.
+func buildAnnounceQuery(infoHash []byte) url.Values {
+	q := url.Values{}
+	q.Set("info_hash", string(infoHash))
+	q.Set("peer_id", "-qB4500-diagnose0001")
+	q.Set("port", "6881")
+	q.Set("uploaded", "0")
+	q.Set("downloaded", "0")
+	q.Set("left", "1") // want to be visible in swarm counts
+	q.Set("compact", "1")
+	q.Set("event", "started")
+	q.Set("numwant", "50")
+	return q
+}
+
 func main() {
 	host := flag.String("host", defaultListenHost, "bind host (use 0.0.0.0 to listen on all interfaces)")
 	port := flag.String("port", defaultListenPortFlag, "listen port")
+	checkArg := flag.String("check", "", "if non-empty, run diagnostic for this magnet or 40-char hex info_hash and exit (does not start the proxy server)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-host HOST] [-port PORT]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-host HOST] [-port PORT] [-check MAGNET|HEX]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nModes:\n")
+		fmt.Fprintf(os.Stderr, "  (default)      Start the HTTP tracker proxy server\n")
+		fmt.Fprintf(os.Stderr, "  -check ARG    Probe every upstream and report per-tracker announce results for the given magnet/hex\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s -host 0.0.0.0 -port 8080\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -check 'magnet:?xt=urn:btih:<40-hex-info-hash>'\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -check <40-hex-info-hash>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -795,6 +970,11 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
+
+	if *checkArg != "" {
+		runCheck(*checkArg)
+		return
+	}
 
 	// SIGINT/SIGTERM 触发 ctx 取消,用于后台 goroutine + HTTP server shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
