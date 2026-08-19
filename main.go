@@ -788,10 +788,13 @@ func refreshLoop(ctx context.Context) {
 // given magnet/info_hash against each one, then prints a per-tracker
 // report. Does not start the HTTP server.
 //
+// If trackerOverride is non-empty, only that single tracker is probed
+// (the ngosang list load and global health check are skipped).
+//
 // Accepts either:
 //   - a magnet URL:  magnet:?xt=urn:btih:<40-hex>
 //   - a raw 40-char hex info_hash
-func runCheck(arg string) {
+func runCheck(arg, trackerOverride string) {
 	infoHash, hexStr, err := extractInfoHash(arg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -800,26 +803,13 @@ func runCheck(arg string) {
 	}
 
 	fmt.Printf("=== tracker proxy diagnostic ===\n")
-	fmt.Printf("info_hash: %s  (%d bytes)\n\n", hexStr, len(infoHash))
-
-	// 1) load + health check
-	fmt.Println("[1/3] loading upstream list...")
-	ctx := context.Background()
-	rawList, err := loadUpstreamList(ctx, upstreamListURL)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load upstream list failed: %v\n", err)
-		os.Exit(1)
+	fmt.Printf("info_hash: %s  (%d bytes)\n", hexStr, len(infoHash))
+	if trackerOverride != "" {
+		fmt.Printf("single tracker: %s\n", trackerOverride)
 	}
-	fmt.Printf("      raw list: %d HTTP + %d UDP\n\n", len(rawList.HTTP), len(rawList.UDP))
+	fmt.Println()
 
-	fmt.Println("[2/3] probing reachability...")
-	t := time.Now()
-	alive := healthCheck(ctx, rawList)
-	fmt.Printf("      alive:    %d HTTP + %d UDP  (%s)\n\n",
-		len(alive.HTTP), len(alive.UDP), time.Since(t).Truncate(100*time.Millisecond))
-
-	// 2) per-tracker announce
-	fmt.Println("[3/3] querying each alive upstream with the info_hash...")
+	ctx := context.Background()
 	q := buildAnnounceQuery(infoHash)
 
 	type row struct {
@@ -829,54 +819,78 @@ func runCheck(arg string) {
 		seeders  int32
 		leechers int32
 	}
-	rows := make([]row, 0, len(alive.HTTP)+len(alive.UDP))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, probeConcurrency)
 
-	queryHTTP := func(target string) {
-		defer wg.Done()
-		defer func() { <-sem }()
-		sem <- struct{}{}
-		cctx, cancel := context.WithTimeout(ctx, upstreamHTTPTimeout)
-		defer cancel()
-		r := queryHTTPTracker(cctx, target, q)
-		mu.Lock()
-		rows = append(rows, row{
-			kind: "HTTP", target: target,
-			peers:    len(r.Peers) / 6,
-			seeders:  r.Complete,
-			leechers: r.Incomplete,
-		})
-		mu.Unlock()
-	}
-	queryUDP := func(target string) {
-		defer wg.Done()
-		defer func() { <-sem }()
-		sem <- struct{}{}
-		cctx, cancel := context.WithTimeout(ctx, upstreamUDPTimeout)
-		defer cancel()
-		r := queryUDPTracker(cctx, target, q)
-		mu.Lock()
-		rows = append(rows, row{
-			kind: "UDP", target: target,
-			peers:    len(r.Peers) / 6,
-			seeders:  r.Complete,
-			leechers: r.Incomplete,
-		})
-		mu.Unlock()
-	}
-	for _, t := range alive.HTTP {
-		wg.Add(1)
-		go queryHTTP(t)
-	}
-	for _, t := range alive.UDP {
-		wg.Add(1)
-		go queryUDP(t)
-	}
-	wg.Wait()
+	var rows []row
 
-	// 3) report
+	if trackerOverride != "" {
+		// Single-tracker mode: skip list load + health check
+		fmt.Println("[1/1] querying the single tracker...")
+		rows = []row{runOneTracker(ctx, trackerOverride, q)}
+	} else {
+		// Multi-tracker mode: load + health check + per-tracker announce
+		fmt.Println("[1/3] loading upstream list...")
+		rawList, err := loadUpstreamList(ctx, upstreamListURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load upstream list failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("      raw list: %d HTTP + %d UDP\n\n", len(rawList.HTTP), len(rawList.UDP))
+
+		fmt.Println("[2/3] probing reachability...")
+		t := time.Now()
+		alive := healthCheck(ctx, rawList)
+		fmt.Printf("      alive:    %d HTTP + %d UDP  (%s)\n\n",
+			len(alive.HTTP), len(alive.UDP), time.Since(t).Truncate(100*time.Millisecond))
+
+		fmt.Println("[3/3] querying each alive upstream with the info_hash...")
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, probeConcurrency)
+
+		queryHTTP := func(target string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sem <- struct{}{}
+			cctx, cancel := context.WithTimeout(ctx, upstreamHTTPTimeout)
+			defer cancel()
+			r := queryHTTPTracker(cctx, target, q)
+			mu.Lock()
+			rows = append(rows, row{
+				kind: "HTTP", target: target,
+				peers:    len(r.Peers) / 6,
+				seeders:  r.Complete,
+				leechers: r.Incomplete,
+			})
+			mu.Unlock()
+		}
+		queryUDP := func(target string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			sem <- struct{}{}
+			cctx, cancel := context.WithTimeout(ctx, upstreamUDPTimeout)
+			defer cancel()
+			r := queryUDPTracker(cctx, target, q)
+			mu.Lock()
+			rows = append(rows, row{
+				kind: "UDP", target: target,
+				peers:    len(r.Peers) / 6,
+				seeders:  r.Complete,
+				leechers: r.Incomplete,
+			})
+			mu.Unlock()
+		}
+		for _, t := range alive.HTTP {
+			wg.Add(1)
+			go queryHTTP(t)
+		}
+		for _, t := range alive.UDP {
+			wg.Add(1)
+			go queryUDP(t)
+		}
+		wg.Wait()
+	}
+
+	// report
 	var totalSeeds, totalLeech int32
 	for _, r := range rows {
 		totalSeeds += r.seeders
@@ -884,7 +898,7 @@ func runCheck(arg string) {
 	}
 
 	fmt.Println()
-	fmt.Println("=== per-tracker results ===")
+	fmt.Println("=== result ===")
 	fmt.Printf("%-7s %-55s %5s %5s %5s\n", "KIND", "TRACKER", "PEERS", "LEECH", "SEEDS")
 	fmt.Println(strings.Repeat("-", 90))
 	var okCount int
@@ -903,8 +917,60 @@ func runCheck(arg string) {
 			r.kind, display, r.peers, r.leechers, r.seeders, status)
 	}
 	fmt.Println(strings.Repeat("-", 90))
-	fmt.Printf("%d trackers responded with data out of %d\n", okCount, len(rows))
+	if len(rows) == 1 {
+		fmt.Printf("single tracker %s\n", statusWord(okCount == 1))
+	} else {
+		fmt.Printf("%d trackers responded with data out of %d\n", okCount, len(rows))
+	}
 	fmt.Printf("sum(seeders)=%d  sum(leechers)=%d\n", totalSeeds, totalLeech)
+}
+
+func statusWord(ok bool) string {
+	if ok {
+		return "responded with data"
+	}
+	return "returned empty / unreachable"
+}
+
+// runOneTracker probes a single tracker URL and returns one row.
+// Kind is determined by the URL scheme.
+func runOneTracker(ctx context.Context, target string, q url.Values) struct {
+	kind     string
+	target   string
+	peers    int
+	seeders  int32
+	leechers int32
+} {
+	var r UpstreamResult
+	switch {
+	case strings.HasPrefix(target, "udp://"):
+		u, err := url.Parse(target)
+		if err != nil || u.Host == "" {
+			fmt.Fprintf(os.Stderr, "bad udp tracker URL: %v\n", err)
+			os.Exit(1)
+		}
+		cctx, cancel := context.WithTimeout(ctx, upstreamUDPTimeout)
+		defer cancel()
+		r = queryUDPTracker(cctx, u.Host, q)
+		return struct {
+			kind     string
+			target   string
+			peers    int
+			seeders  int32
+			leechers int32
+		}{"UDP", target, len(r.Peers) / 6, r.Complete, r.Incomplete}
+	default:
+		cctx, cancel := context.WithTimeout(ctx, upstreamHTTPTimeout)
+		defer cancel()
+		r = queryHTTPTracker(cctx, target, q)
+		return struct {
+			kind     string
+			target   string
+			peers    int
+			seeders  int32
+			leechers int32
+		}{"HTTP", target, len(r.Peers) / 6, r.Complete, r.Incomplete}
+	}
 }
 
 // extractInfoHash returns 20-byte info_hash + canonical hex string.
@@ -954,15 +1020,18 @@ func main() {
 	host := flag.String("host", defaultListenHost, "bind host (use 0.0.0.0 to listen on all interfaces)")
 	port := flag.String("port", defaultListenPortFlag, "listen port")
 	checkArg := flag.String("check", "", "if non-empty, run diagnostic for this magnet or 40-char hex info_hash and exit (does not start the proxy server)")
+	trackerArg := flag.String("tracker", "", "with -check, probe only this single tracker (http(s)://host:port/announce or udp://host:port); skips the ngosang list and health check")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-host HOST] [-port PORT] [-check MAGNET|HEX]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-host HOST] [-port PORT] [-check MAGNET|HEX] [-tracker URL]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nModes:\n")
-		fmt.Fprintf(os.Stderr, "  (default)      Start the HTTP tracker proxy server\n")
-		fmt.Fprintf(os.Stderr, "  -check ARG    Probe every upstream and report per-tracker announce results for the given magnet/hex\n")
+		fmt.Fprintf(os.Stderr, "  (default)              Start the HTTP tracker proxy server\n")
+		fmt.Fprintf(os.Stderr, "  -check ARG             Probe every upstream and report per-tracker announce results for the given magnet/hex\n")
+		fmt.Fprintf(os.Stderr, "  -check ARG -tracker URL  Probe only the given single tracker URL (skip ngosang list)\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  %s -host 0.0.0.0 -port 8080\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -check 'magnet:?xt=urn:btih:<40-hex-info-hash>'\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -check <40-hex-info-hash>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -check <40-hex-info-hash> -tracker 'https://<host>:<port>/announce'\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -check <40-hex-info-hash> -tracker 'udp://<host>:<port>'\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -972,7 +1041,7 @@ func main() {
 	})))
 
 	if *checkArg != "" {
-		runCheck(*checkArg)
+		runCheck(*checkArg, *trackerArg)
 		return
 	}
 
