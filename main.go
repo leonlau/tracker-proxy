@@ -71,6 +71,21 @@ type UpstreamResult struct {
 	Incomplete int32
 }
 
+// httpTransport is a package-level *http.Transport shared by every HTTP
+// request the proxy makes — queryHTTPTracker, probeHTTPTracker, and
+// loadUpstreamList. The connection pool means DNS + TCP + TLS handshakes
+// are reused for any tracker we've talked to within IdleConnTimeout,
+// so the second-and-later request to the same upstream drops from
+// ~100 ms to a few ms. http.Transport is safe for concurrent use.
+var httpTransport = &http.Transport{
+	MaxIdleConns:          200,
+	MaxIdleConnsPerHost:   5,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   5 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ForceAttemptHTTP2:     true,
+}
+
 // upstreamList 持有当前生效的列表
 // 启动时填充 fallback,后台 goroutine 每 2 小时刷新一次
 var upstreamList atomic.Pointer[UpstreamList]
@@ -335,7 +350,7 @@ func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) Upstrea
 	// ("Go-http-client/1.1") at the WAF. Pretend to be a real client.
 	req.Header.Set("User-Agent", btClientUserAgent)
 
-	client := http.Client{Timeout: upstreamHTTPTimeout}
+	client := http.Client{Transport: httpTransport, Timeout: upstreamHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		// 网络/DNS/超时 — 公开 tracker 常态,DEBUG 级别
@@ -546,7 +561,7 @@ func probeHTTPTracker(ctx context.Context, tracker string) bool {
 		return false
 	}
 
-	client := &http.Client{Timeout: probeHTTPTimeout}
+	client := &http.Client{Transport: httpTransport, Timeout: probeHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
@@ -731,7 +746,7 @@ func loadUpstreamList(ctx context.Context, url string) (*UpstreamList, error) {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 
-	client := &http.Client{Timeout: upstreamListTimeout}
+	client := &http.Client{Transport: httpTransport, Timeout: upstreamListTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: %w", err)
