@@ -35,7 +35,7 @@ const (
 	upstreamHTTPTimeout = 4 * time.Second
 	upstreamUDPTimeout  = 3 * time.Second
 	upstreamListTimeout = 30 * time.Second
-	overallTimeout      = 5 * time.Second
+	overallTimeout      = 15 * time.Second
 	refreshInterval     = 2 * time.Hour
 	defaultNumWant      = 50
 	defaultPeerPort     = 6881 // BT client peer port fallback (BT protocol convention)
