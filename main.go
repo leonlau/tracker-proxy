@@ -92,6 +92,17 @@ func init() {
 	upstreamList.Store(fallbackUpstreams)
 }
 
+// version / commit are injected at link time by the release workflow:
+//
+//	go build -ldflags "-X main.version=${{ github.ref_name }} \
+//	                   -X main.commit=${{ github.sha }}"
+//
+// Local builds default to "dev" / "none" so logs are still meaningful.
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 // cacheMaxEntries caps the announce response cache. LRU eviction kicks in
 // at this size — old / rarely-accessed info_hashes get bumped out so the
 // cache can't grow without bound.
@@ -1039,6 +1050,10 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
+
+	slog.Info("tracker proxy starting",
+		"version", version,
+		"commit", commit)
 
 	if *checkArg != "" {
 		runCheck(*checkArg, *trackerArg)
