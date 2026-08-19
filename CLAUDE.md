@@ -89,3 +89,20 @@ Go version is `1.25.1` (see `go.mod`); range-over-int and `any` are in active us
 - `sendResponse` — reverse-decode the bencode response to assert structure.
 
 End-to-end HTTP tests are **not** included — they would require either a real upstream or a UDP/HTTP mock layer, which isn't worth the complexity for the surface area covered. Add one only if you change `announceHandler` itself.
+
+## Test data hygiene — never commit real test artifacts
+
+**Rule:** any magnet / info_hash / tracker URL used for diagnostics during development must not be committed, even in `flag.Usage` strings, doc comments, or example output. Use placeholders.
+
+- Bad: `tracker-proxy -check 'magnet:?xt=urn:btih:<actual-40-hex-from-a-real-magnet>'`
+- Bad: `tracker-proxy -check <actual-hash> -tracker 'https://<real-tracker-domain>/announce'`
+- Good: `tracker-proxy -check 'magnet:?xt=urn:btih:<40-hex-info-hash>'`
+- Good: `tracker-proxy -check <40-hex-info-hash> -tracker 'https://<host>:<port>/announce'`
+
+(Treat *any* 40-char hex after `urn:btih:`, and *any* URL with a real-looking domain in code, as a leak — even inside an anti-example.)
+
+This applies even to `slog.Warn` example messages and error strings. The grep targets are obvious: any 40-char hex string inside `urn:btih:`, or any URL with a real-looking domain in code.
+
+**Exception:** the `fallbackUpstreams` list in `main.go` is configuration, not test data — stable public trackers like `tracker.opentrackr.org` belong there. The rule is about *transient* diagnostic values, not configured defaults.
+
+**Why this matters:** a committed `git grep -S <hash>` walks through every public clone. If the magnet is even semi-private (e.g. an internal tracker dump, a leet file, a private tracker share), the hash is a unique fingerprint that links the repo to that resource forever — even after `git filter-branch`, old objects remain reachable via reflog until `git gc --prune=now`, and force-pushed history is only as clean as you remembered to scrub.
