@@ -90,19 +90,23 @@ Go version is `1.25.1` (see `go.mod`); range-over-int and `any` are in active us
 
 End-to-end HTTP tests are **not** included — they would require either a real upstream or a UDP/HTTP mock layer, which isn't worth the complexity for the surface area covered. Add one only if you change `announceHandler` itself.
 
-## Test data hygiene — never commit real test artifacts
+## Working agreement with the human operator
 
-**Rule:** any magnet / info_hash / tracker URL used for diagnostics during development must not be committed, even in `flag.Usage` strings, doc comments, or example output. Use placeholders.
+**Do not run any of these without an explicit instruction in the current turn:**
 
-- Bad: `tracker-proxy -check 'magnet:?xt=urn:btih:<actual-40-hex-from-a-real-magnet>'`
-- Bad: `tracker-proxy -check <actual-hash> -tracker 'https://<real-tracker-domain>/announce'`
-- Good: `tracker-proxy -check 'magnet:?xt=urn:btih:<40-hex-info-hash>'`
-- Good: `tracker-proxy -check <40-hex-info-hash> -tracker 'https://<host>:<port>/announce'`
+- `git commit` / `git commit --amend`
+- `git push` (including `--force`)
+- `git tag` / `git push --tags`
+- `gh release create` / `gh release delete`
+- `git filter-branch` / `git filter-repo` / `git gc --prune`
+- Any package publish (npm / cargo / equivalent)
 
-(Treat *any* 40-char hex after `urn:btih:`, and *any* URL with a real-looking domain in code, as a leak — even inside an anti-example.)
+Default behavior when the user says "fix X" or "implement Y":
 
-This applies even to `slog.Warn` example messages and error strings. The grep targets are obvious: any 40-char hex string inside `urn:btih:`, or any URL with a real-looking domain in code.
+1. Make the in-tree edits.
+2. Run `go build` and `go test` to verify the change compiles and passes.
+3. **Stop and show the user the diff.** Wait for an explicit "commit", "push", "tag", "release" before doing any outward-facing action.
 
-**Exception:** the `fallbackUpstreams` list in `main.go` is configuration, not test data — stable public trackers like `tracker.opentrackr.org` belong there. The rule is about *transient* diagnostic values, not configured defaults.
+This rule holds even when the action looks obviously correct, the user said "go ahead and clean this up" earlier, or the previous turn ended with an uncommitted change. Each outward-facing action gets its own yes in its own turn.
 
-**Why this matters:** a committed `git grep -S <hash>` walks through every public clone. If the magnet is even semi-private (e.g. an internal tracker dump, a leet file, a private tracker share), the hash is a unique fingerprint that links the repo to that resource forever — even after `git filter-branch`, old objects remain reachable via reflog until `git gc --prune=now`, and force-pushed history is only as clean as you remembered to scrub.
+Anything that changes remote state — branches, tags, releases, history rewrites, package registries — falls under this rule. The implied scope of "fix X" is the working tree, not the remote.
