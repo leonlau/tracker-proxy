@@ -37,7 +37,13 @@ const (
 	overallTimeout      = 5 * time.Second
 	refreshInterval     = 2 * time.Hour
 	defaultNumWant      = 50
-	defaultPeerPort     = 6881  // BT 客户端默认 peer port(BT 协议规范)
+	defaultPeerPort     = 6881 // BT client peer port fallback (BT protocol convention)
+
+	// health check — startup and after each list refresh, async filter unreachable
+	probeHTTPTimeout = 3 * time.Second
+	probeUDPTimeout  = 2 * time.Second
+	probeConcurrency = 30
+	probeOverallMax  = 30 * time.Second
 
 	// HTTP server 默认监听 — 可被 -host / -port flag 覆盖
 	defaultListenHost = "127.0.0.1"
@@ -504,6 +510,160 @@ func sendResponse(w http.ResponseWriter, r UpstreamResult) {
 	_, _ = w.Write(data)
 }
 
+// probeHTTPTracker lightweight HTTP health check.
+// Sends a minimal announce and verifies 200 + valid bencode.
+func probeHTTPTracker(ctx context.Context, tracker string) bool {
+	u, err := url.Parse(tracker)
+	if err != nil {
+		return false
+	}
+	q := url.Values{}
+	q.Set("info_hash", string(make([]byte, 20))) // all-zero hash
+	q.Set("peer_id", "-qp0000-probe12345678")
+	q.Set("port", "6881")
+	q.Set("uploaded", "0")
+	q.Set("downloaded", "0")
+	q.Set("left", "0")
+	q.Set("compact", "1")
+	q.Set("event", "stopped")
+	q.Set("numwant", "0")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false
+	}
+
+	client := &http.Client{Timeout: probeHTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+
+	var probe struct {
+		Peers []byte `bencode:"peers"`
+	}
+	if err := bencode.DecodeBytes(data, &probe); err != nil {
+		return false
+	}
+	return true
+}
+
+// probeUDPTracker lightweight UDP health check.
+// Sends only the BEP 15 connect step, verifies magic + action + tx match.
+// Faster than full connect+announce and needs no info_hash.
+func probeUDPTracker(ctx context.Context, addr string) bool {
+	server, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return false
+	}
+	conn, err := net.DialUDP("udp", nil, server)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	if d, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(d)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(probeUDPTimeout))
+	}
+
+	transaction := rand.Uint32()
+	req := make([]byte, 16)
+	binary.BigEndian.PutUint64(req[0:8], 0x41727101980)
+	binary.BigEndian.PutUint32(req[8:12], 0)
+	binary.BigEndian.PutUint32(req[12:16], transaction)
+
+	if _, err := conn.Write(req); err != nil {
+		return false
+	}
+
+	resp := make([]byte, 16)
+	n, err := conn.Read(resp)
+	if err != nil || n < 16 {
+		return false
+	}
+
+	action := binary.BigEndian.Uint32(resp[0:4])
+	tx := binary.BigEndian.Uint32(resp[4:8])
+	return action == 0 && tx == transaction
+}
+
+// healthCheck concurrently probes every upstream and filters out the
+// unreachable ones. Returns a new UpstreamList containing only alive
+// entries; if the overall context times out, unfinished probes are
+// dropped (so a slow upstream won't block the result forever).
+func healthCheck(parent context.Context, list *UpstreamList) *UpstreamList {
+	ctx, cancel := context.WithTimeout(parent, probeOverallMax)
+	defer cancel()
+
+	var (
+		mu          sync.Mutex
+		aliveHTTP   = make([]string, 0, len(list.HTTP))
+		aliveUDP    = make([]string, 0, len(list.UDP))
+		wg          sync.WaitGroup
+		sem         = make(chan struct{}, probeConcurrency)
+		httpDropped int
+		udpDropped  int
+	)
+
+	checkHTTP := func(t string) {
+		defer wg.Done()
+		defer func() { <-sem }()
+		sem <- struct{}{}
+		if probeHTTPTracker(ctx, t) {
+			mu.Lock()
+			aliveHTTP = append(aliveHTTP, t)
+			mu.Unlock()
+		} else {
+			mu.Lock()
+			httpDropped++
+			mu.Unlock()
+		}
+	}
+	checkUDP := func(t string) {
+		defer wg.Done()
+		defer func() { <-sem }()
+		sem <- struct{}{}
+		if probeUDPTracker(ctx, t) {
+			mu.Lock()
+			aliveUDP = append(aliveUDP, t)
+			mu.Unlock()
+		} else {
+			mu.Lock()
+			udpDropped++
+			mu.Unlock()
+		}
+	}
+
+	for _, t := range list.HTTP {
+		wg.Add(1)
+		go checkHTTP(t)
+	}
+	for _, t := range list.UDP {
+		wg.Add(1)
+		go checkUDP(t)
+	}
+	wg.Wait()
+
+	slog.Info("upstream health check complete",
+		"http_alive", len(aliveHTTP), "http_dropped", httpDropped,
+		"udp_alive", len(aliveUDP), "udp_dropped", udpDropped)
+
+	return &UpstreamList{HTTP: aliveHTTP, UDP: aliveUDP}
+}
+
 // parseTrackerList 解析 ngosang/trackerslist 风格的纯文本列表
 //
 //	udp://host:port/announce     -> UDP,只保留 host:port
@@ -578,12 +738,15 @@ func loadUpstreamList(ctx context.Context, url string) (*UpstreamList, error) {
 	return parseTrackerList(data), nil
 }
 
-// refreshLoop 后台每 refreshInterval 拉一次上游;成功才替换,失败保留旧列表
+// refreshLoop 后台每 refreshInterval 拉一次上游。
+// 拉到的 raw 列表立即生效(不等 health check),health check 在
+// goroutine 里异步跑完后用过滤后的列表覆盖。这样:
+//   - 服务启动后立刻可用(不会被 health check 阻塞)
+//   - 经过 ~30s 后,atomic.Pointer 里替换成只含 alive 上游的列表
 func refreshLoop(ctx context.Context) {
 	ticker := time.NewTicker(refreshInterval)
 	defer ticker.Stop()
 
-	// 启动立即拉一次,不阻塞 main
 	doRefresh := func() {
 		cctx, cancel := context.WithTimeout(ctx, upstreamListTimeout+5*time.Second)
 		defer cancel()
@@ -594,9 +757,18 @@ func refreshLoop(ctx context.Context) {
 				"err", err)
 			return
 		}
+
 		upstreamList.Store(list)
-		slog.Info("upstream list refreshed",
+		slog.Info("upstream list refreshed (raw, probing in background)",
 			"http", len(list.HTTP), "udp", len(list.UDP))
+
+		// 异步 health check,过滤后覆盖 atomic.Pointer
+		go func() {
+			checked := healthCheck(ctx, list)
+			upstreamList.Store(checked)
+			slog.Info("upstream list filtered",
+				"http", len(checked.HTTP), "udp", len(checked.UDP))
+		}()
 	}
 
 	doRefresh()

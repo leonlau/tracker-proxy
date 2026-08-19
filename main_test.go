@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -544,6 +548,194 @@ func TestParseUDPAnnounceResponse_TooShort(t *testing.T) {
 	r := parseUDPAnnounceResponse([]byte{1, 2, 3})
 	if r.Peers != nil || r.Complete != 0 || r.Incomplete != 0 {
 		t.Errorf("short buf should return zero result, got %+v", r)
+	}
+}
+
+// --- probe / health check tests ---
+
+type mockUDPTracker struct {
+	conn   *net.UDPConn
+	action uint32 // 0 = correct connect response, anything else = protocol error
+}
+
+func newMockUDPTracker(t *testing.T) (*mockUDPTracker, string) {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	m := &mockUDPTracker{conn: c, action: 0}
+	go m.serve()
+	return m, c.LocalAddr().String()
+}
+
+func (m *mockUDPTracker) serve() {
+	buf := make([]byte, 2048)
+	for {
+		n, raddr, err := m.conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if n < 16 {
+			continue
+		}
+		// BEP 15 connect response: action(4) + tx(4) + connection_id(8)
+		resp := make([]byte, 16)
+		binary.BigEndian.PutUint32(resp[0:4], m.action)
+		copy(resp[4:8], buf[12:16])                              // echo tx
+		binary.BigEndian.PutUint64(resp[8:16], 0x123456789ABCDEF0) // arbitrary conn id
+		m.conn.WriteToUDP(resp, raddr)
+	}
+}
+
+func (m *mockUDPTracker) close() { m.conn.Close() }
+
+func TestProbeUDPTracker_Alive(t *testing.T) {
+	m, addr := newMockUDPTracker(t)
+	defer m.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if !probeUDPTracker(ctx, addr) {
+		t.Errorf("probeUDPTracker should return true for healthy server")
+	}
+}
+
+func TestProbeUDPTracker_NoResponse(t *testing.T) {
+	// Open UDP but never reply
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if probeUDPTracker(ctx, c.LocalAddr().String()) {
+		t.Errorf("probeUDPTracker should return false when no response")
+	}
+}
+
+func TestProbeUDPTracker_BadAction(t *testing.T) {
+	m, addr := newMockUDPTracker(t)
+	defer m.close()
+	m.action = 3
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if probeUDPTracker(ctx, addr) {
+		t.Errorf("probeUDPTracker should return false when action != 0")
+	}
+}
+
+func TestProbeUDPTracker_Unreachable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if probeUDPTracker(ctx, "127.0.0.1:1") {
+		t.Errorf("probeUDPTracker should return false for unreachable")
+	}
+}
+
+func TestProbeHTTPTracker_Alive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		// Minimal valid bencode response: {"peers": "<6 bytes>"}
+		w.Write([]byte("d5:peers6:\x01\x02\x03\x04\x05\x06ee"))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if !probeHTTPTracker(ctx, srv.URL+"/announce") {
+		t.Errorf("probeHTTPTracker should return true for healthy server")
+	}
+}
+
+func TestProbeHTTPTracker_Non200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if probeHTTPTracker(ctx, srv.URL+"/announce") {
+		t.Errorf("probeHTTPTracker should return false for 503")
+	}
+}
+
+func TestProbeHTTPTracker_BadBencode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not bencode"))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if probeHTTPTracker(ctx, srv.URL+"/announce") {
+		t.Errorf("probeHTTPTracker should return false for non-bencode body")
+	}
+}
+
+func TestProbeHTTPTracker_Unreachable(t *testing.T) {
+	// Pick a free port and immediately close it
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := c.LocalAddr().(*net.UDPAddr).Port
+	c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if probeHTTPTracker(ctx, fmt.Sprintf("http://127.0.0.1:%d/announce", port)) {
+		t.Errorf("probeHTTPTracker should return false for unreachable")
+	}
+}
+
+func TestHealthCheck_FiltersUnreachable(t *testing.T) {
+	alive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("d5:peers6:\x01\x02\x03\x04\x05\x06ee"))
+	}))
+	defer alive.Close()
+
+	// Reserve a port and release it so we know nothing is listening there
+	c, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	deadPort := c.LocalAddr().(*net.UDPAddr).Port
+	c.Close()
+
+	mockUDP, udpAddr := newMockUDPTracker(t)
+	defer mockUDP.close()
+
+	input := &UpstreamList{
+		HTTP: []string{
+			alive.URL + "/announce",
+			fmt.Sprintf("http://127.0.0.1:%d/announce", deadPort),
+		},
+		UDP: []string{
+			udpAddr,
+			"127.0.0.1:1",
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result := healthCheck(ctx, input)
+
+	if len(result.HTTP) != 1 || result.HTTP[0] != alive.URL+"/announce" {
+		t.Errorf("HTTP filter: got %v, want only alive", result.HTTP)
+	}
+	if len(result.UDP) != 1 || result.UDP[0] != udpAddr {
+		t.Errorf("UDP filter: got %v, want only alive", result.UDP)
 	}
 }
 
