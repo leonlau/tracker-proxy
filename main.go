@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,7 +37,11 @@ const (
 	overallTimeout      = 5 * time.Second
 	refreshInterval     = 2 * time.Hour
 	defaultNumWant      = 50
-	defaultListenPort   = 6881
+	defaultPeerPort     = 6881  // BT 客户端默认 peer port(BT 协议规范)
+
+	// HTTP server 默认监听 — 可被 -host / -port flag 覆盖
+	defaultListenHost = "127.0.0.1"
+	defaultListenPortFlag = "6969"
 )
 
 // UpstreamList 当前生效的上游 tracker 列表
@@ -423,7 +428,7 @@ func queryUDPTracker(ctx context.Context, addr string, q url.Values) UpstreamRes
 
 	port := uint32Param(q, "port")
 	if port == 0 || port > 0xFFFF {
-		port = defaultListenPort
+		port = defaultPeerPort
 	}
 
 	key := rand.Uint32()
@@ -607,6 +612,14 @@ func refreshLoop(ctx context.Context) {
 }
 
 func main() {
+	host := flag.String("host", defaultListenHost, "bind host (use 0.0.0.0 to listen on all interfaces)")
+	port := flag.String("port", defaultListenPortFlag, "listen port")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [-host HOST] [-port PORT]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
@@ -620,8 +633,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/announce", announceHandler)
 
+	addr := net.JoinHostPort(*host, *port)
 	srv := &http.Server{
-		Addr:    ":8080",
+		Addr:    addr,
 		Handler: mux,
 	}
 
@@ -636,7 +650,7 @@ func main() {
 		}
 	}()
 
-	slog.Info("tracker proxy listening", "addr", ":8080")
+	slog.Info("tracker proxy listening", "addr", addr)
 	// ListenAndServe 在 Shutdown 被调后返回 http.ErrServerClosed,这是正常路径
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("listen failed", "err", err)
