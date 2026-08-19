@@ -242,14 +242,24 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	infoHashKey := string(infoHashBytes)
+	hashHex := fmt.Sprintf("%x", infoHashBytes)
+	remote := r.RemoteAddr
 
-	// 缓存命中直接返回
+	// 缓存命中直接返回 — 短路径,不计时
 	if result, ok := cacheGet(infoHashKey); ok {
+		slog.Info("announce cache hit",
+			"info_hash", hashHex,
+			"peers", len(result.Peers)/6,
+			"complete", result.Complete,
+			"incomplete", result.Incomplete,
+			"remote", remote,
+		)
 		sendResponse(w, result)
 		return
 	}
 
-	// 整体超时,避免被最慢的上游阻塞
+	// 缓存未命中 — 走上游 fan-out,记录耗时
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), overallTimeout)
 	defer cancel()
 
@@ -257,10 +267,19 @@ func announceHandler(w http.ResponseWriter, r *http.Request) {
 
 	if len(result.Peers) == 0 {
 		slog.Warn("no peers from any upstream",
-			"info_hash", fmt.Sprintf("%x", infoHashBytes))
+			"info_hash", hashHex, "remote", remote)
 	}
 
 	cacheSet(infoHashKey, result)
+
+	slog.Info("announce completed",
+		"info_hash", hashHex,
+		"peers", len(result.Peers)/6,
+		"complete", result.Complete,
+		"incomplete", result.Incomplete,
+		"elapsed_ms", time.Since(start).Milliseconds(),
+		"remote", remote,
+	)
 	sendResponse(w, result)
 }
 
