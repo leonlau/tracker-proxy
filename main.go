@@ -46,6 +46,11 @@ const (
 	probeConcurrency = 30
 	probeOverallMax  = 30 * time.Second
 
+	// btClientUserAgent is what we send as User-Agent on HTTP upstream
+	// requests. Cloudflare-fronted trackers reject Go's default UA, so
+	// we pose as a real BT client.
+	btClientUserAgent = "qBittorrent/4.6.0"
+
 	// HTTP server 默认监听 — 可被 -host / -port flag 覆盖
 	defaultListenHost = "127.0.0.1"
 	defaultListenPortFlag = "6969"
@@ -323,6 +328,9 @@ func queryHTTPTracker(ctx context.Context, tracker string, q url.Values) Upstrea
 		slog.Warn("build request failed", "url", tracker, "err", err)
 		return UpstreamResult{}
 	}
+	// Cloudflare-fronted upstreams reject the Go stdlib default
+	// ("Go-http-client/1.1") at the WAF. Pretend to be a real client.
+	req.Header.Set("User-Agent", btClientUserAgent)
 
 	client := http.Client{Timeout: upstreamHTTPTimeout}
 	resp, err := client.Do(req)
