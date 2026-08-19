@@ -89,24 +89,3 @@ Go version is `1.25.1` (see `go.mod`); range-over-int and `any` are in active us
 - `sendResponse` — reverse-decode the bencode response to assert structure.
 
 End-to-end HTTP tests are **not** included — they would require either a real upstream or a UDP/HTTP mock layer, which isn't worth the complexity for the surface area covered. Add one only if you change `announceHandler` itself.
-
-## Working agreement with the human operator
-
-**Do not run any of these without an explicit instruction in the current turn:**
-
-- `git commit` / `git commit --amend`
-- `git push` (including `--force`)
-- `git tag` / `git push --tags`
-- `gh release create` / `gh release delete`
-- `git filter-branch` / `git filter-repo` / `git gc --prune`
-- Any package publish (npm / cargo / equivalent)
-
-Default behavior when the user says "fix X" or "implement Y":
-
-1. Make the in-tree edits.
-2. Run `go build` and `go test` to verify the change compiles and passes.
-3. **Stop and show the user the diff.** Wait for an explicit "commit", "push", "tag", "release" before doing any outward-facing action.
-
-This rule holds even when the action looks obviously correct, the user said "go ahead and clean this up" earlier, or the previous turn ended with an uncommitted change. Each outward-facing action gets its own yes in its own turn.
-
-Anything that changes remote state — branches, tags, releases, history rewrites, package registries — falls under this rule. The implied scope of "fix X" is the working tree, not the remote.
