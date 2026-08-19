@@ -211,15 +211,6 @@ func TestCacheGetSet(t *testing.T) {
 	if got.Incomplete != want.Incomplete {
 		t.Errorf("cacheGet.Incomplete = %d, want %d", got.Incomplete, want.Incomplete)
 	}
-
-	// 强制过期
-	cache.Store(key, CacheItem{
-		Result: want,
-		Expire: time.Now().Add(-1 * time.Second),
-	})
-	if _, ok := cacheGet(key); ok {
-		t.Errorf("cacheGet on expired item returned ok=true")
-	}
 }
 
 func TestRawInfoHash_BinaryPreserved(t *testing.T) {

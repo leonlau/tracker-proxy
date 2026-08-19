@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/zeebo/bencode"
 )
 
@@ -31,7 +32,7 @@ import (
 const upstreamListURL = "https://ngosang.github.io/trackerslist/trackers_all.txt"
 
 const (
-	cacheTTL            = 5 * time.Minute
+	cacheTTL            = 30 * time.Minute
 	upstreamHTTPTimeout = 4 * time.Second
 	upstreamUDPTimeout  = 3 * time.Second
 	upstreamListTimeout = 30 * time.Second
@@ -91,31 +92,22 @@ func init() {
 	upstreamList.Store(fallbackUpstreams)
 }
 
-type CacheItem struct {
-	Result UpstreamResult
-	Expire time.Time
-}
+// cacheMaxEntries caps the announce response cache. LRU eviction kicks in
+// at this size — old / rarely-accessed info_hashes get bumped out so the
+// cache can't grow without bound.
+const cacheMaxEntries = 10000
 
-var cache sync.Map
+// cache is keyed by raw 20-byte info_hash (stringified). The LRU itself
+// enforces TTL: every Add stamps expireAt = now+cacheTTL, and expired
+// entries are evicted on Get.
+var cache = expirable.NewLRU[string, UpstreamResult](cacheMaxEntries, nil, cacheTTL)
 
 func cacheGet(key string) (UpstreamResult, bool) {
-	v, ok := cache.Load(key)
-	if !ok {
-		return UpstreamResult{}, false
-	}
-	item := v.(CacheItem)
-	if time.Now().After(item.Expire) {
-		cache.Delete(key)
-		return UpstreamResult{}, false
-	}
-	return item.Result, true
+	return cache.Get(key)
 }
 
 func cacheSet(key string, r UpstreamResult) {
-	cache.Store(key, CacheItem{
-		Result: r,
-		Expire: time.Now().Add(cacheTTL),
-	})
+	cache.Add(key, r)
 }
 
 // rawInfoHash 从 url.Values 拿到 info_hash 的 20 字节原始数据
